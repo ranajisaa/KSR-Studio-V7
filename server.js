@@ -1,20 +1,24 @@
 import express from "express";
 import multer from "multer";
 import dotenv from "dotenv";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 const MODEL = process.env.VEO_MODEL || "veo-3.1-generate-preview";
+const VIDEO_DIR = path.join(__dirname, "videos");
+fs.mkdirSync(VIDEO_DIR, { recursive: true });
+
+app.use(express.json({ limit: "1mb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -23,202 +27,157 @@ const upload = multer({
 
 const jobs = new Map();
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.static(path.join(__dirname, "public")));
+function getClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  return apiKey ? new GoogleGenAI({ apiKey }) : null;
+}
 
-function apiHeaders() {
+function errorMessage(err) {
+  if (!err) return "Unknown Gemini API error.";
+  if (typeof err === "string") return err;
+  if (err.message) return err.message;
+  if (err.error?.message) return err.error.message;
+  try { return JSON.stringify(err); } catch { return "Gemini API request failed."; }
+}
+
+function publicJob(job) {
   return {
-    "x-goog-api-key": process.env.GEMINI_API_KEY || "",
-    "Content-Type": "application/json"
+    id: job.id,
+    status: job.status,
+    message: job.message,
+    progress: job.progress,
+    videoUrl: job.videoUrl || null,
+    error: job.error || null
   };
 }
 
-function safeError(body, fallback = "Gemini API request failed") {
-  return body?.error?.message || body?.message || fallback;
-}
-
-app.get("/api/health", async (_req, res) => {
-  const configured = Boolean(process.env.GEMINI_API_KEY);
+app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    configured,
-    model: MODEL,
-    message: configured
-      ? "Gemini API key is configured."
-      : "Gemini API key is not configured."
+    configured: Boolean(process.env.GEMINI_API_KEY),
+    model: MODEL
   });
 });
 
 app.post("/api/generate", upload.single("image"), async (req, res) => {
   try {
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(400).json({ error: "GEMINI_API_KEY is not configured. Run npm run setup." });
-    }
+    const ai = getClient();
+    if (!ai) return res.status(503).json({ error: "GEMINI_API_KEY is not configured on Render." });
 
-    const prompt = String(req.body.prompt || "").trim();
-    const aspectRatio = req.body.aspectRatio === "16:9" ? "16:9" : "9:16";
-    const durationSeconds = ["4", "6", "8"].includes(String(req.body.durationSeconds))
-      ? String(req.body.durationSeconds)
-      : "8";
+    const prompt = String(req.body?.prompt || "").trim();
+    const aspectRatio = req.body?.aspectRatio === "16:9" ? "16:9" : "9:16";
+    const durationSeconds = Number(req.body?.durationSeconds || 8);
 
     if (!prompt) return res.status(400).json({ error: "Prompt is required." });
     if (!req.file) return res.status(400).json({ error: "Please select an image." });
-
-    const mimeType = req.file.mimetype || "image/jpeg";
-    if (!["image/jpeg", "image/png", "image/webp"].includes(mimeType)) {
+    if (!["image/jpeg", "image/png", "image/webp"].includes(req.file.mimetype)) {
       return res.status(400).json({ error: "Use JPG, PNG or WEBP image." });
     }
 
-    // Image-to-video requests use the official Veo REST long-running operation.
-    // 720p supports 4/6/8 seconds. Reference/image-based generation requires 8s
-    // on the current Veo 3.1 API, so force 8s for image input.
-    const finalDuration = "8";
-
-    const payload = {
-      instances: [{
-        prompt,
-        image: {
-          inlineData: {
-            mimeType,
-            data: req.file.buffer.toString("base64")
-          }
-        }
-      }],
-      parameters: {
+    // IMPORTANT: Do not construct a raw REST `inlineData` object here.
+    // The official JS SDK accepts an Image object with imageBytes + mimeType.
+    let operation = await ai.models.generateVideos({
+      model: MODEL,
+      prompt,
+      image: {
+        imageBytes: req.file.buffer.toString("base64"),
+        mimeType: req.file.mimetype
+      },
+      config: {
         aspectRatio,
-        durationSeconds: finalDuration,
+        durationSeconds: 8,
         resolution: "720p",
         numberOfVideos: 1,
         personGeneration: "allow_adult"
       }
-    };
-
-    const response = await fetch(
-      `${BASE_URL}/models/${encodeURIComponent(MODEL)}:predictLongRunning`,
-      {
-        method: "POST",
-        headers: apiHeaders(),
-        body: JSON.stringify(payload)
-      }
-    );
-
-    const data = await response.json();
-    if (!response.ok) return res.status(response.status).json({ error: safeError(data) });
-
-    const operationName = data.name;
-    if (!operationName) {
-      return res.status(502).json({ error: "Gemini did not return an operation name." });
-    }
+    });
 
     const id = crypto.randomUUID();
     jobs.set(id, {
       id,
-      operationName,
+      operation,
       status: "processing",
+      progress: 5,
+      message: "Veo is generating your video…",
       createdAt: Date.now(),
-      videoUri: null,
-      error: null
+      videoUrl: null,
+      error: null,
+      durationSeconds
     });
 
-    res.json({ jobId: id, status: "processing" });
+    res.json({ ok: true, jobId: id, status: "processing" });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || "Server error" });
+    console.error("Veo start error:", err);
+    res.status(500).json({ error: errorMessage(err) });
   }
 });
 
 app.get("/api/status/:id", async (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) return res.status(404).json({ error: "Job not found." });
+  if (!job) return res.status(404).json({ error: "Job not found. The server may have restarted." });
+
+  if (job.status === "ready" || job.status === "error") {
+    return res.json(publicJob(job));
+  }
 
   try {
-    if (job.status === "ready" || job.status === "error") return res.json(job);
+    const ai = getClient();
+    if (!ai) throw new Error("GEMINI_API_KEY is not configured on Render.");
 
-    const response = await fetch(
-      `${BASE_URL}/${job.operationName}`,
-      { headers: { "x-goog-api-key": process.env.GEMINI_API_KEY } }
-    );
-    const data = await response.json();
+    job.operation = await ai.operations.getVideosOperation({ operation: job.operation });
 
-    if (!response.ok) {
-      job.status = "error";
-      job.error = safeError(data);
-      return res.status(response.status).json(job);
+    if (!job.operation.done) {
+      job.progress = Math.min(88, job.progress + 4);
+      job.message = "Veo is creating your video…";
+      return res.json(publicJob(job));
     }
 
-    if (!data.done) {
-      job.status = "processing";
-      return res.json({
-        id: job.id,
-        status: "processing",
-        createdAt: job.createdAt
-      });
+    if (job.operation.error) {
+      throw new Error(errorMessage(job.operation.error));
     }
 
-    if (data.error) {
-      job.status = "error";
-      job.error = safeError(data);
-      return res.json(job);
-    }
+    const generated = job.operation.response?.generatedVideos?.[0]?.video;
+    if (!generated) throw new Error("Generation finished, but no video was returned.");
 
-    const uri = data?.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri;
-    if (!uri) {
-      job.status = "error";
-      job.error = "Generation finished, but no video URI was returned.";
-      return res.json(job);
-    }
+    job.status = "downloading";
+    job.progress = 92;
+    job.message = "Saving MP4…";
+
+    const filename = `KSR_${Date.now()}_${crypto.randomBytes(3).toString("hex")}.mp4`;
+    const outputPath = path.join(VIDEO_DIR, filename);
+
+    // Let the official SDK handle the generated-video download/authentication.
+    await ai.files.download({
+      file: generated,
+      downloadPath: outputPath
+    });
 
     job.status = "ready";
-    job.videoUri = uri;
-
-    return res.json({
-      id: job.id,
-      status: "ready",
-      videoUrl: `/api/video/${job.id}`,
-      createdAt: job.createdAt
-    });
+    job.progress = 100;
+    job.message = "🎬 Video ready!";
+    job.videoUrl = `/api/video/${encodeURIComponent(filename)}`;
+    return res.json(publicJob(job));
   } catch (err) {
+    console.error("Veo status error:", err);
     job.status = "error";
-    job.error = err.message || "Status check failed.";
-    return res.status(500).json(job);
+    job.message = "Generation failed.";
+    job.error = errorMessage(err);
+    return res.status(500).json(publicJob(job));
   }
 });
 
-app.get("/api/video/:id", async (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job || job.status !== "ready" || !job.videoUri) {
-    return res.status(404).send("Video is not ready.");
-  }
-
-  try {
-    const response = await fetch(job.videoUri, {
-      headers: { "x-goog-api-key": process.env.GEMINI_API_KEY }
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      return res.status(response.status).send(text || "Video download failed.");
-    }
-
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `inline; filename="ksr-studio-${job.id}.mp4"`);
-    if (response.headers.get("content-length")) {
-      res.setHeader("Content-Length", response.headers.get("content-length"));
-    }
-
-    if (response.body) {
-      for await (const chunk of response.body) res.write(chunk);
-      res.end();
-    } else {
-      res.end(Buffer.from(await response.arrayBuffer()));
-    }
-  } catch (err) {
-    res.status(500).send(err.message || "Video proxy failed.");
-  }
+app.get("/api/video/:filename", (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const filePath = path.join(VIDEO_DIR, filename);
+  if (!fs.existsSync(filePath)) return res.status(404).send("Video not found.");
+  res.type("mp4").sendFile(filePath);
 });
 
-app.listen(PORT, () => {
-  console.log(`\nKSR Studio V7 running at http://localhost:${PORT}`);
+app.get("*", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`KSR Studio V8 running on port ${PORT}`);
   console.log(`Model: ${MODEL}`);
-  console.log("Stop with Ctrl+C.\n");
 });

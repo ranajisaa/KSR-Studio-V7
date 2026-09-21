@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KSR Studio V7 — AI Video Generator</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#090b10;color:#f5f7fb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:920px;margin:auto;padding:22px}.brand{font-size:28px;font-weight:800}.sub{color:#9ba3b4;margin-top:4px}
+.card{background:#121621;border:1px solid #252b38;border-radius:18px;padding:18px;margin-top:18px}
+label{display:block;font-weight:700;margin:14px 0 7px}input,textarea,select{width:100%;background:#0c0f15;color:#fff;border:1px solid #303747;border-radius:12px;padding:12px;font:inherit}
+textarea{min-height:130px;resize:vertical}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+button{width:100%;border:0;border-radius:12px;padding:14px;font-weight:800;font-size:16px;background:#fff;color:#090b10;cursor:pointer;margin-top:16px}
+button:disabled{opacity:.45}.status{padding:11px 13px;border-radius:12px;background:#0c0f15;color:#b9c2d3;margin-top:12px}
+.ok{color:#8be28b}.bad{color:#ff8f8f}.preview{width:100%;max-height:600px;background:#000;border-radius:14px;margin-top:14px}
+.small{font-size:13px;color:#858ea0}.hidden{display:none}
+@media(max-width:650px){.grid{grid-template-columns:1fr}.wrap{padding:14px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">🎬 KSR Studio V7</div>
+  <div class="sub">Realistic image → video workspace</div>
+
+  <div class="card">
+    <div id="connection" class="status">Checking Gemini connection…</div>
+
+    <label>Source image</label>
+    <input id="image" type="file" accept="image/jpeg,image/png,image/webp">
+    <div id="imageInfo" class="small">JPG, PNG or WEBP • max 15 MB</div>
+
+    <label>Video prompt</label>
+    <textarea id="prompt" placeholder="Example: Cinematic realistic camera movement, natural motion, preserve the person's face and clothing, subtle wind, realistic Indian environment, no cartoon look."></textarea>
+
+    <div class="grid">
+      <div>
+        <label>Aspect ratio</label>
+        <select id="aspect">
+          <option value="9:16">9:16 Portrait</option>
+          <option value="16:9">16:9 Landscape</option>
+        </select>
+      </div>
+      <div>
+        <label>Duration</label>
+        <select id="duration">
+          <option value="8">8 seconds (image-to-video)</option>
+          <option value="6" disabled>6 seconds — text-to-video only</option>
+          <option value="4" disabled>4 seconds — text-to-video only</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="generate">Generate Video</button>
+    <div id="status" class="status hidden"></div>
+    <video id="video" class="preview hidden" controls playsinline></video>
+    <a id="download" class="hidden" style="display:block;text-align:center;margin-top:12px;color:#fff" download>⬇️ Download MP4</a>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+async function check(){
+  try{
+    const r=await fetch('/api/health'); const d=await r.json();
+    $('connection').innerHTML=d.configured
+      ? '<span class="ok">● Gemini API key configured</span> • '+d.model
+      : '<span class="bad">● Gemini API key missing</span> • run <b>npm run setup</b>';
+  }catch(e){$('connection').innerHTML='<span class="bad">● Server not reachable</span>'}
+}
+check();
+
+$('image').addEventListener('change',()=>{
+  const f=$('image').files[0];
+  $('imageInfo').textContent=f?`${f.name} • ${(f.size/1024/1024).toFixed(1)} MB`:'JPG, PNG or WEBP • max 15 MB';
+});
+
+$('generate').onclick=async()=>{
+  const file=$('image').files[0], prompt=$('prompt').value.trim();
+  if(!file) return alert('Please select an image.');
+  if(!prompt) return alert('Please write a video prompt.');
+
+  $('generate').disabled=true;
+  $('video').classList.add('hidden'); $('download').classList.add('hidden');
+  $('status').classList.remove('hidden'); $('status').textContent='Starting Veo generation…';
+
+  const fd=new FormData();
+  fd.append('image',file); fd.append('prompt',prompt);
+  fd.append('aspectRatio',$('aspect').value); fd.append('durationSeconds',$('duration').value);
+
+  try{
+    const r=await fetch('/api/generate',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error||'Generation could not start.');
+    poll(d.jobId);
+  }catch(e){
+    $('status').textContent='❌ '+e.message; $('generate').disabled=false;
+  }
+};
+
+async function poll(id){
+  for(let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,10000));
+    try{
+      const r=await fetch('/api/status/'+id); const d=await r.json();
+      if(!r.ok) throw new Error(d.error||'Status request failed.');
+      if(d.status==='processing'){
+        $('status').textContent='⏳ Generating… please keep this page open.';
+        continue;
+      }
+      if(d.status==='error') throw new Error(d.error||'Video generation failed.');
+      if(d.status==='ready'){
+        $('status').textContent='✅ Video ready!';
+        $('video').src=d.videoUrl; $('video').classList.remove('hidden');
+        $('download').href=d.videoUrl; $('download').classList.remove('hidden');
+        $('generate').disabled=false; return;
+      }
+    }catch(e){
+      $('status').textContent='❌ '+e.message; $('generate').disabled=false; return;
+    }
+  }
+  $('status').textContent='⌛ Generation is taking longer than expected. Check again later.';
+  $('generate').disabled=false;
+}
+</script>
+</body>
+</html>
